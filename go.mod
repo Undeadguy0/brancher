@@ -1,4 +1,4 @@
-module module github.com/Undeadguy0/brancher
+module github.com/Undeadguy0/brancher
 
 go 1.26.5
 
