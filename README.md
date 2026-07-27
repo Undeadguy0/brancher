@@ -12,7 +12,7 @@
     go build -o brancher main.go
 
     #Или установка в $GOPATH/bin
-    go install github.com/yourname/brancher@latest
+    go install github.com/Undeadguy0/Brancher@latest
 
 ```
     
