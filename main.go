@@ -18,6 +18,7 @@ type options struct {
 	forceBranch   string
 	silent        bool
 	rewrite       bool
+	removeGit     bool
 }
 
 // resolveRoot определяет корень проекта: флаг -p, затем позиционный [path], затем текущая директория.
@@ -28,7 +29,7 @@ func resolveRoot(project string, args []string) (string, error) {
 
 	path := project
 	if len(args) == 1 {
-		if path != "" && filepath.Clean(path) != filepath.Clean(args[0]) {
+		if path != "" && !samePath(path, args[0]) {
 			return "", fmt.Errorf("Путь к проекту указан дважды (-p %q и %q). Укажите что-то одно", path, args[0])
 		}
 		path = args[0]
@@ -56,6 +57,15 @@ func resolveRoot(project string, args []string) (string, error) {
 	}
 
 	return abs, nil
+}
+
+func samePath(a, b string) bool {
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	if errA != nil || errB != nil {
+		return filepath.Clean(a) == filepath.Clean(b)
+	}
+	return absA == absB
 }
 
 // branchFor возвращает ветку для remote: --force-branch, HEAD-ветку remote или --default-branch.
@@ -112,21 +122,50 @@ func newRootCmd() *cobra.Command {
 	o := &options{}
 
 	rootCmd := &cobra.Command{
-		Use:           "brancher [path]",
-		Long:          "Консольная утилита для моего git-push агента. Запускается в проекте с git и создает базовую структуру .branches для всех remote",
+		Use:   "brancher [path]",
+		Short: "Создаёт и редактирует .branches для git-push агента",
+		Long: "Консольная утилита для моего git-push агента. Запускается в проекте с git и создает базовую структуру .branches для всех remote.\n" +
+			"Без подкоманды работает как `brancher init`.",
 		Args:          cobra.MaximumNArgs(1),
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE:          o.createBranchesFile,
 	}
 
-	rootCmd.Flags().StringVarP(&o.defaultBranch, "default-branch", "b", "master", "Название ветки, подставляемое в итоговый шаблон по-умолчанию. По-умолчанию master")
-	rootCmd.Flags().StringVarP(&o.projectRoot, "project", "p", "", "Путь к корню целевого проекта. По-умолчанию директория, откуда запустили утилиту")
-	rootCmd.Flags().StringVarP(&o.forceBranch, "force-branch", "f", "", "Если установлен, будет выбирать ставить эту ветку, а не HEAD ветку репозитория")
-	rootCmd.Flags().BoolVarP(&o.silent, "silent", "s", false, "Не выводить предупреждения.")
-	rootCmd.Flags().BoolVarP(&o.rewrite, "rewrite", "r", false, "Перезаписать .branches-файл, если таковой будет найден")
+	pf := rootCmd.PersistentFlags()
+	pf.StringVarP(&o.projectRoot, "project", "p", "", "Путь к корню целевого проекта. По-умолчанию директория, откуда запустили утилиту")
+	pf.StringVarP(&o.defaultBranch, "default-branch", "b", "master", "Название ветки, подставляемое, если HEAD-ветку remote определить не удалось.")
+	pf.BoolVarP(&o.silent, "silent", "s", false, "Не выводить предупреждения.")
+
+	addInitFlags(rootCmd, o)
+
+	initCmd := &cobra.Command{
+		Use:   "init [path]",
+		Short: "Создать .branches для всех remote (то же, что brancher без подкоманды)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE:  o.createBranchesFile,
+	}
+	addInitFlags(initCmd, o)
+
+	rootCmd.AddCommand(
+		initCmd,
+		newSetCmd(o),
+		newAddCmd(o),
+		newRmCmd(o),
+		newListCmd(o),
+		newSyncCmd(o),
+	)
 
 	return rootCmd
+}
+
+func addForceBranchFlag(cmd *cobra.Command, o *options) {
+	cmd.Flags().StringVarP(&o.forceBranch, "force-branch", "f", "", "Если установлен, будет ставить эту ветку, а не HEAD ветку репозитория")
+}
+
+func addInitFlags(cmd *cobra.Command, o *options) {
+	addForceBranchFlag(cmd, o)
+	cmd.Flags().BoolVarP(&o.rewrite, "rewrite", "r", false, "Перезаписать .branches-файл, если таковой будет найден")
 }
 
 func main() {

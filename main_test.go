@@ -220,6 +220,13 @@ func TestInitHonorsProjectRoot(t *testing.T) {
 		assertTargets(t, repo, Target{Remote: "origin", Branch: "main"})
 	})
 
+	t.Run("same path twice", func(t *testing.T) {
+		repo := cloneRepo(t, bare)
+		t.Chdir(repo)
+		mustRun(t, "-p", ".", repo)
+		assertTargets(t, repo, Target{Remote: "origin", Branch: "main"})
+	})
+
 	t.Run("conflict", func(t *testing.T) {
 		repo := cloneRepo(t, bare)
 		if r := run(t, "-p", repo, other); r.err == nil {
@@ -328,4 +335,224 @@ func TestParseLsRemoteSymref(t *testing.T) {
 			t.Errorf("parseLsRemoteSymref(%q) = %q, %v; want %q", in, got, ok, want)
 		}
 	}
+}
+
+func TestInitSubcommandAlias(t *testing.T) {
+	isolateGit(t)
+	bare := newBareRemote(t, "main")
+	repo := cloneRepo(t, bare)
+
+	mustRun(t, "init", repo)
+	assertTargets(t, repo, Target{Remote: "origin", Branch: "main"})
+
+	if r := run(t, "init", "-p", repo); r.err == nil {
+		t.Fatal("init без -r должен падать на существующем файле")
+	}
+	mustRun(t, "init", "-p", repo, "-r", "-f", "dev")
+	assertTargets(t, repo, Target{Remote: "origin", Branch: "dev"})
+}
+
+func TestSet(t *testing.T) {
+	isolateGit(t)
+	repo := newRepo(t)
+
+	if r := run(t, "set", "-p", repo, "origin", "dev"); r.err == nil || !strings.Contains(r.err.Error(), "не найден") {
+		t.Fatalf("без .branches ожидалась ошибка, got %v", r.err)
+	}
+
+	writeTargets(t, repo,
+		Target{Remote: "github", Branch: "master"},
+		Target{Remote: "gitlab", Branch: "master"},
+	)
+	mustRun(t, "set", "-p", repo, "github", "release")
+	assertTargets(t, repo,
+		Target{Remote: "github", Branch: "release"},
+		Target{Remote: "gitlab", Branch: "master"},
+	)
+
+	r := run(t, "set", "-p", repo, "nope", "dev")
+	if r.err == nil || !strings.Contains(r.err.Error(), "brancher add") || !strings.Contains(r.err.Error(), "brancher sync") {
+		t.Fatalf("ожидалась ошибка с подсказкой add/sync, got %v", r.err)
+	}
+
+	t.Chdir(repo)
+	mustRun(t, "set", "gitlab", "main")
+	assertTargets(t, repo,
+		Target{Remote: "github", Branch: "release"},
+		Target{Remote: "gitlab", Branch: "main"},
+	)
+}
+
+func TestAdd(t *testing.T) {
+	isolateGit(t)
+	bareMain := newBareRemote(t, "main")
+	bareDev := newBareRemote(t, "develop")
+	repo := cloneRepo(t, bareMain)
+
+	// Существующий git remote, .branches ещё нет — файл создаётся, ветка из symbolic-ref.
+	mustRun(t, "add", "-p", repo, "origin")
+	assertTargets(t, repo, Target{Remote: "origin", Branch: "main"})
+
+	// Повторное добавление — ошибка.
+	if r := run(t, "add", "-p", repo, "origin"); r.err == nil || !strings.Contains(r.err.Error(), "уже есть") {
+		t.Fatalf("ожидалась ошибка о существующей цели, got %v", r.err)
+	}
+
+	// С url: создаётся git remote, ветка определяется через ls-remote.
+	mustRun(t, "add", "-p", repo, "upstream", bareDev)
+	if got := git(t, repo, "remote", "get-url", "upstream"); strings.TrimSpace(got) != bareDev {
+		t.Fatalf("url upstream = %q", got)
+	}
+	assertTargets(t, repo,
+		Target{Remote: "origin", Branch: "main"},
+		Target{Remote: "upstream", Branch: "develop"},
+	)
+
+	// С url и явной веткой.
+	mustRun(t, "add", "-p", repo, "mirror", bareDev, "custom")
+	// Без url, ветка через -f.
+	git(t, repo, "remote", "add", "backup", bareDev)
+	mustRun(t, "add", "-p", repo, "backup", "-f", "forced")
+	assertTargets(t, repo,
+		Target{Remote: "origin", Branch: "main"},
+		Target{Remote: "upstream", Branch: "develop"},
+		Target{Remote: "mirror", Branch: "custom"},
+		Target{Remote: "backup", Branch: "forced"},
+	)
+
+	// url для remote, который уже есть в git (но не в .branches) — ошибка, git не трогаем.
+	git(t, repo, "remote", "add", "extra", bareDev)
+	if r := run(t, "add", "-p", repo, "extra", bareMain); r.err == nil || !strings.Contains(r.err.Error(), "уже существует в git") {
+		t.Fatalf("ожидалась ошибка о существующем git remote, got %v", r.err)
+	}
+	if got := git(t, repo, "remote", "get-url", "extra"); strings.TrimSpace(got) != bareDev {
+		t.Fatalf("url extra изменился: %q", got)
+	}
+
+	// Без url для несуществующего remote — ошибка.
+	if r := run(t, "add", "-p", repo, "ghost"); r.err == nil || !strings.Contains(r.err.Error(), "не найден в git") {
+		t.Fatalf("ожидалась ошибка о неизвестном remote, got %v", r.err)
+	}
+
+	// Недоступный remote — --default-branch с предупреждением.
+	missing := filepath.Join(t.TempDir(), "missing.git")
+	r := mustRun(t, "add", "-p", repo, "dead", missing, "-b", "fallback")
+	if !strings.Contains(r.stderr, "неизвестна HEAD-ветка") {
+		t.Fatalf("ожидалось предупреждение, stderr=%q", r.stderr)
+	}
+	got := readTargets(t, repo)
+	if last := got[len(got)-1]; last != (Target{Remote: "dead", Branch: "fallback"}) {
+		t.Fatalf("последняя цель = %+v", last)
+	}
+
+	if r := run(t, "add", "-p", repo, "--", "-x", bareMain); r.err == nil {
+		t.Fatal("имя remote, начинающееся с '-', должно отклоняться")
+	}
+}
+
+func TestRm(t *testing.T) {
+	isolateGit(t)
+	bare := newBareRemote(t, "main")
+	repo := cloneRepo(t, bare)
+	git(t, repo, "remote", "add", "second", bare)
+	git(t, repo, "remote", "add", "third", bare)
+	writeTargets(t, repo,
+		Target{Remote: "origin", Branch: "main"},
+		Target{Remote: "second", Branch: "main"},
+		Target{Remote: "third", Branch: "main"},
+	)
+
+	mustRun(t, "rm", "-p", repo, "second")
+	assertTargets(t, repo,
+		Target{Remote: "origin", Branch: "main"},
+		Target{Remote: "third", Branch: "main"},
+	)
+	if remotes, _ := listRemotes(repo); !reflect.DeepEqual(remotes, []string{"origin", "second", "third"}) {
+		t.Fatalf("без --git remote не должен удаляться, remotes=%v", remotes)
+	}
+
+	mustRun(t, "rm", "-p", repo, "--git", "third")
+	assertTargets(t, repo, Target{Remote: "origin", Branch: "main"})
+	if remotes, _ := listRemotes(repo); !reflect.DeepEqual(remotes, []string{"origin", "second"}) {
+		t.Fatalf("с --git remote должен удаляться, remotes=%v", remotes)
+	}
+
+	if r := run(t, "rm", "-p", repo, "second"); r.err == nil {
+		t.Fatal("удаление отсутствующей цели должно давать ошибку")
+	}
+
+	mustRun(t, "rm", "-p", repo, "origin")
+	assertTargets(t, repo)
+}
+
+func TestList(t *testing.T) {
+	isolateGit(t)
+	bare := newBareRemote(t, "main")
+	repo := cloneRepo(t, bare)
+	git(t, repo, "remote", "add", "newone", bare)
+
+	r := mustRun(t, "list", repo)
+	if !strings.Contains(r.stdout, "не найден") || !strings.Contains(r.stdout, "origin  [нет в .branches]") {
+		t.Fatalf("list без файла:\n%s", r.stdout)
+	}
+
+	writeTargets(t, repo,
+		Target{Remote: "origin", Branch: "main"},
+		Target{Remote: "gone", Branch: "dev"},
+	)
+	r = mustRun(t, "list", "-p", repo)
+	for _, want := range []string{
+		"  origin -> main\n",
+		"  gone -> dev  [нет такого remote в git]\n",
+		"  newone  [нет в .branches]\n",
+	} {
+		if !strings.Contains(r.stdout, want) {
+			t.Errorf("в выводе нет %q:\n%s", want, r.stdout)
+		}
+	}
+	if strings.Contains(r.stdout, "origin  [нет в .branches]") {
+		t.Errorf("origin ошибочно помечен как отсутствующий:\n%s", r.stdout)
+	}
+}
+
+func TestSync(t *testing.T) {
+	isolateGit(t)
+	bareMain := newBareRemote(t, "main")
+	bareDev := newBareRemote(t, "develop")
+	repo := cloneRepo(t, bareMain)
+
+	// Без файла — создаёт.
+	mustRun(t, "sync", "-p", repo)
+	assertTargets(t, repo, Target{Remote: "origin", Branch: "main"})
+
+	// Существующие цели не меняются (даже если ветка «устарела»), новые добавляются в конец.
+	writeTargets(t, repo,
+		Target{Remote: "gone", Branch: "x"},
+		Target{Remote: "origin", Branch: "custom"},
+	)
+	git(t, repo, "remote", "add", "upstream", bareDev)
+	git(t, repo, "remote", "add", "another", bareMain)
+	mustRun(t, "sync", repo)
+	assertTargets(t, repo,
+		Target{Remote: "gone", Branch: "x"},
+		Target{Remote: "origin", Branch: "custom"},
+		Target{Remote: "another", Branch: "main"},
+		Target{Remote: "upstream", Branch: "develop"},
+	)
+
+	// Повторный sync — ничего не меняет.
+	before, _ := os.ReadFile(filepath.Join(repo, ".branches"))
+	r := mustRun(t, "sync", "-p", repo)
+	after, _ := os.ReadFile(filepath.Join(repo, ".branches"))
+	if !bytes.Equal(before, after) || !strings.Contains(r.stdout, "ничего не изменено") {
+		t.Fatalf("повторный sync изменил файл или вывел %q", r.stdout)
+	}
+
+	// Без remote и без файла — сообщение, файла нет.
+	empty := newRepo(t)
+	r = mustRun(t, "sync", "-p", empty)
+	if !strings.Contains(r.stdout, "нет установленных удаленных репозиториев") {
+		t.Fatalf("stdout: %q", r.stdout)
+	}
+	assertNoFile(t, empty)
 }
